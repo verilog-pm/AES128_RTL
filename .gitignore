@@ -1,0 +1,27 @@
+# Simulation waveforms and build outputs
+*.vcd
+*.vvp
+*.fst
+sim/**/sim_build/
+sim/**/__pycache__/
+**/__pycache__/
+*.pyc
+sim/**/sim.log
+
+# Vivado project, cache, and logs
+fpga/vivado_prj*/
+fpga/.Xil/
+fpga/*.log
+fpga/*.jou
+fpga/*.backup.log
+*.str
+*.pb
+*.wdf
+*.wpc
+*.dcp
+*.bit
+*.ltx
+
+# Simulator transcripts
+/transcript
+*.wlf

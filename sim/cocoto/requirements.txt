@@ -1,0 +1,2 @@
+cocotb>=1.6
+pycryptodome>=3.15
