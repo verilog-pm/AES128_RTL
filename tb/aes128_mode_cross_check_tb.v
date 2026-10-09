@@ -16,6 +16,10 @@
 
 module aes128_mode_cross_check_tb;
 
+localparam TB_DW = 32;
+localparam TB_KW = TB_DW / 8;
+localparam TB_BEATS = 128 / TB_DW;
+
 // =============================================================================
 // Parameters
 // =============================================================================
@@ -49,37 +53,75 @@ end
 // =============================================================================
 reg  [127:0] tb_key;
 reg          tb_key_valid;
-wire         tb_key_ready;
-reg          tb_mode;      // 0=encrypt, 1=decrypt
+reg          tb_mode;      // 0=encrypt core, 1=decrypt core (CTR always uses encrypt)
 reg  [1:0]   tb_op_mode;   // 01=CBC, 10=CTR
 reg  [127:0] tb_iv;
 reg          tb_iv_valid;
-wire         tb_iv_ready;
-reg  [127:0] tb_data_in;
+reg  [TB_DW-1:0] tb_data_in;
 reg          tb_data_in_valid;
+reg          tb_data_in_last;
+reg  [TB_KW-1:0] tb_data_in_keep;
 wire         tb_data_in_ready;
-wire [127:0] tb_data_out;
+wire [TB_DW-1:0] tb_data_out;
 wire         tb_data_out_valid;
+wire         tb_data_out_last;
+wire [TB_KW-1:0] tb_data_out_keep;
 reg          tb_data_out_ready;
 
-aes128_top dut (
+wire         enc_ready, dec_ready;
+wire         enc_out_valid, dec_out_valid;
+wire         enc_last, dec_last;
+wire [TB_DW-1:0] enc_out, dec_out;
+wire [TB_KW-1:0] enc_keep, dec_keep;
+wire         use_enc = (tb_mode == 1'b0) || (tb_op_mode == 2'b10);
+
+aes128_top #(.mode(1'b0)) dut_enc (
     .clk(tb_clk),
     .rst_n(tb_rst_n),
     .key(tb_key),
     .key_valid(tb_key_valid),
-    .key_ready(tb_key_ready),
-    .mode(tb_mode),
     .op_mode(tb_op_mode),
     .iv(tb_iv),
-    .iv_valid(tb_iv_valid),
-    .iv_ready(tb_iv_ready),
+    .iv_valid(tb_iv_valid && use_enc),
     .data_in(tb_data_in),
-    .data_in_valid(tb_data_in_valid),
-    .data_in_ready(tb_data_in_ready),
-    .data_out(tb_data_out),
-    .data_out_valid(tb_data_out_valid),
+    .data_in_valid(tb_data_in_valid && use_enc),
+    .data_in_last(tb_data_in_last && use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(enc_ready),
+    .data_out(enc_out),
+    .data_out_valid(enc_out_valid),
+    .data_out_last(enc_last),
+    .data_out_keep(enc_keep),
     .data_out_ready(tb_data_out_ready)
 );
+
+aes128_top #(.mode(1'b1)) dut_dec (
+    .clk(tb_clk),
+    .rst_n(tb_rst_n),
+    .key(tb_key),
+    .key_valid(tb_key_valid),
+    .op_mode(tb_op_mode),
+    .iv(tb_iv),
+    .iv_valid(tb_iv_valid && !use_enc),
+    .data_in(tb_data_in),
+    .data_in_valid(tb_data_in_valid && !use_enc),
+    .data_in_last(tb_data_in_last && !use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(dec_ready),
+    .data_out(dec_out),
+    .data_out_valid(dec_out_valid),
+    .data_out_last(dec_last),
+    .data_out_keep(dec_keep),
+    .data_out_ready(tb_data_out_ready)
+);
+
+assign tb_data_in_ready  = use_enc ? enc_ready : dec_ready;
+assign tb_data_out       = use_enc ? enc_out : dec_out;
+assign tb_data_out_valid = use_enc ? enc_out_valid : dec_out_valid;
+assign tb_data_out_last  = use_enc ? enc_last : dec_last;
+assign tb_data_out_keep  = use_enc ? enc_keep : dec_keep;
+
+`include "aes_stream_tasks.vh"
 
 // =============================================================================
 // Vector storage (golden model, from pycryptodome via gen_mode_vectors.py)
@@ -111,59 +153,46 @@ begin
 end
 endtask
 
+// Result beats for the message currently being streamed. Kept at module
+// scope because Icarus Verilog rejects unpacked-array task ports.
+reg [127:0] msg_result [0:BLOCKS_PER_MESSAGE-1];
+
 // =============================================================================
 // Task: stream one message (BLOCKS_PER_MESSAGE blocks starting at base_idx)
 // into the DUT back-to-back with random 0..MAX_GAP idle-cycle gaps, while a
-// parallel process collects the results in arrival order.
+// parallel process collects the results in arrival order into msg_result.
 // =============================================================================
 task stream_message;
     input integer   base_idx;
     input           use_ct_as_src;  // 0: source=plaintext, 1: source=ciphertext
-    output [127:0]  dst [0:BLOCKS_PER_MESSAGE-1];
     integer sent, received, gap;
+    reg saw_last;
+    reg [127:0] got;
 begin
     sent = 0;
     received = 0;
 
     fork
         begin : send_proc
-            // Present each block and hold data_in_valid asserted until the
-            // DUT actually asserts data_in_ready for it (handles CBC-encrypt
-            // backpressure, where acceptance can be delayed by many cycles).
             while (sent < BLOCKS_PER_MESSAGE) begin
-                tb_data_in = use_ct_as_src ? vec_ciphertext[base_idx + sent]
-                                            : vec_plaintext[base_idx + sent];
-                tb_data_in_valid = 1;
-                // Wait for this exact block to be accepted.
-                do begin
-                    @(posedge tb_clk);
-                end while (!tb_data_in_ready);
+                send_block(use_ct_as_src ? vec_ciphertext[base_idx + sent]
+                                         : vec_plaintext[base_idx + sent], 1'b1);
                 sent = sent + 1;
-`ifdef DEBUG_TRACE
-                $display("[%0t] DEBUG send: sent=%0d data_in=%h", $time, sent, tb_data_in);
-`endif
-
                 if (sent < BLOCKS_PER_MESSAGE) begin
                     gap = $urandom_range(0, MAX_GAP);
-                    if (gap > 0) begin
-                        tb_data_in_valid = 0;
+                    if (gap > 0)
                         repeat (gap) @(posedge tb_clk);
-                    end
                 end
             end
-            tb_data_in_valid = 0;
         end
 
         begin : recv_proc
             while (received < BLOCKS_PER_MESSAGE) begin
-                @(posedge tb_clk);
-                if (tb_data_out_valid && tb_data_out_ready) begin
-                    dst[received] = tb_data_out;
-                    received = received + 1;
-`ifdef DEBUG_TRACE
-                    $display("[%0t] DEBUG recv: received=%0d data_out=%h", $time, received, tb_data_out);
-`endif
-                end
+                recv_block(got, saw_last);
+                if (!saw_last)
+                    got = {128{1'bx}};
+                msg_result[received] = got;
+                received = received + 1;
             end
         end
     join
@@ -184,7 +213,6 @@ task run_test_category;
     output integer  pass_cnt;
     output integer  fail_cnt;
     integer m, b, base_idx;
-    reg [127:0] msg_result [0:BLOCKS_PER_MESSAGE-1];
     reg [127:0] expected;
 begin
     pass_cnt = 0;
@@ -200,21 +228,22 @@ begin
             tb_key = vec_key[base_idx];
             tb_key_valid = 1;
             @(posedge tb_clk);
+            #1;
             tb_key_valid = 0;
-            while (!tb_key_ready) @(posedge tb_clk);
+            while (!tb_data_in_ready) @(posedge tb_clk);
             last_key = vec_key[base_idx];
         end
 
-        // Load this message's IV / initial counter. Must wait for the
-        // pipeline to be fully drained (iv_ready) before (re)seeding it.
-        while (!tb_iv_ready) @(posedge tb_clk);
+        // Latch this message's IV. The core installs it once idle and holds
+        // data_in_ready low until then.
         tb_iv = vec_iv[base_idx];
         tb_iv_valid = 1;
         @(posedge tb_clk);
+        #1;
         tb_iv_valid = 0;
         repeat (2) @(posedge tb_clk);
 
-        stream_message(base_idx, use_ct_as_src, msg_result);
+        stream_message(base_idx, use_ct_as_src);
 
         for (b = 0; b < BLOCKS_PER_MESSAGE; b = b + 1) begin
             expected = use_ct_as_src ? vec_plaintext[base_idx + b] : vec_ciphertext[base_idx + b];
@@ -246,7 +275,9 @@ initial begin
 
     tb_key_valid = 0;
     tb_data_in_valid = 0;
-    tb_data_in = 128'h0;
+    tb_data_in_last = 0;
+    tb_data_in_keep = {TB_KW{1'b0}};
+    tb_data_in = {TB_DW{1'b0}};
     tb_mode = 1'b0;
     tb_op_mode = 2'b00;
     tb_key = 128'h0;

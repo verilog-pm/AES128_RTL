@@ -20,6 +20,10 @@
 
 module aes128_streaming_cross_check_tb;
 
+localparam TB_DW = 32;
+localparam TB_KW = TB_DW / 8;
+localparam TB_BEATS = 128 / TB_DW;
+
 // =============================================================================
 // Parameters
 // =============================================================================
@@ -59,33 +63,72 @@ end
 // =============================================================================
 reg  [127:0] tb_key;
 reg          tb_key_valid;
-wire         tb_key_ready;
 reg          tb_mode;
-reg  [127:0] tb_data_in;
+reg  [TB_DW-1:0] tb_data_in;
 reg          tb_data_in_valid;
+reg          tb_data_in_last;
+reg  [TB_KW-1:0] tb_data_in_keep;
 wire         tb_data_in_ready;
-wire [127:0] tb_data_out;
+wire [TB_DW-1:0] tb_data_out;
 wire         tb_data_out_valid;
+wire         tb_data_out_last;
+wire [TB_KW-1:0] tb_data_out_keep;
 reg          tb_data_out_ready;
 
-aes128_top dut (
+wire         enc_ready, dec_ready;
+wire         enc_out_valid, dec_out_valid;
+wire         enc_last, dec_last;
+wire [TB_DW-1:0] enc_out, dec_out;
+wire [TB_KW-1:0] enc_keep, dec_keep;
+wire         use_enc = (tb_mode == 1'b0);
+
+aes128_top #(.mode(1'b0)) dut_enc (
     .clk(tb_clk),
     .rst_n(tb_rst_n),
     .key(tb_key),
     .key_valid(tb_key_valid),
-    .key_ready(tb_key_ready),
-    .mode(tb_mode),
-    .op_mode(2'b00),      // ECB (this testbench cross-checks ECB streaming)
+    .op_mode(2'b00),
     .iv(128'h0),
     .iv_valid(1'b0),
-    .iv_ready(),
     .data_in(tb_data_in),
-    .data_in_valid(tb_data_in_valid),
-    .data_in_ready(tb_data_in_ready),
-    .data_out(tb_data_out),
-    .data_out_valid(tb_data_out_valid),
+    .data_in_valid(tb_data_in_valid && use_enc),
+    .data_in_last(tb_data_in_last && use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(enc_ready),
+    .data_out(enc_out),
+    .data_out_valid(enc_out_valid),
+    .data_out_last(enc_last),
+    .data_out_keep(enc_keep),
     .data_out_ready(tb_data_out_ready)
 );
+
+aes128_top #(.mode(1'b1)) dut_dec (
+    .clk(tb_clk),
+    .rst_n(tb_rst_n),
+    .key(tb_key),
+    .key_valid(tb_key_valid),
+    .op_mode(2'b00),
+    .iv(128'h0),
+    .iv_valid(1'b0),
+    .data_in(tb_data_in),
+    .data_in_valid(tb_data_in_valid && !use_enc),
+    .data_in_last(tb_data_in_last && !use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(dec_ready),
+    .data_out(dec_out),
+    .data_out_valid(dec_out_valid),
+    .data_out_last(dec_last),
+    .data_out_keep(dec_keep),
+    .data_out_ready(tb_data_out_ready)
+);
+
+assign tb_data_in_ready  = use_enc ? enc_ready : dec_ready;
+assign tb_data_out       = use_enc ? enc_out : dec_out;
+assign tb_data_out_valid = use_enc ? enc_out_valid : dec_out_valid;
+assign tb_data_out_last  = use_enc ? enc_last : dec_last;
+assign tb_data_out_keep  = use_enc ? enc_keep : dec_keep;
+
+`include "aes_stream_tasks.vh"
 
 // =============================================================================
 // Vector storage (golden model, from pycryptodome via gen_stream_vectors.py)
@@ -124,12 +167,14 @@ end
 // into `dst`. Blocks are correlated by arrival order, matching the DUT's
 // in-order pipeline + FIFO behavior.
 // =============================================================================
+// use_ct selects the source and the result array. Unpacked-array task
+// ports are rejected by Icarus Verilog, so the arrays stay at module scope.
 task stream_blocks;
-    input [127:0] src [0:NUM_VECTORS-1];
-    output [127:0] dst [0:NUM_VECTORS-1];
+    input use_ct;
     integer sent;
     integer received;
-    integer gap;
+    reg saw_last;
+    reg [127:0] got;
 begin
     sent = 0;
     received = 0;
@@ -137,34 +182,24 @@ begin
     fork
         begin : send_proc
             while (sent < NUM_VECTORS) begin
-                @(posedge tb_clk);
-                if (tb_data_in_ready) begin
-                    tb_data_in = src[sent];
-                    tb_data_in_valid = 1;
-                    sent = sent + 1;
-
-                    if (sent < NUM_VECTORS) begin
-                        // gap = $urandom_range(0, MAX_GAP);
-                        gap = 0;
-                        if (gap > 0) begin
-                            @(posedge tb_clk);
-                            tb_data_in_valid = 0;
-                            repeat (gap - 1) @(posedge tb_clk);
-                        end
-                    end
-                end
+                if (use_ct)
+                    send_block(vec_ciphertext[sent], 1'b1);
+                else
+                    send_block(vec_plaintext[sent], 1'b1);
+                sent = sent + 1;
             end
-            @(posedge tb_clk);
-            tb_data_in_valid = 0;
         end
 
         begin : recv_proc
             while (received < NUM_VECTORS) begin
-                @(posedge tb_clk);
-                if (tb_data_out_valid && tb_data_out_ready) begin
-                    dst[received] = tb_data_out;
-                    received = received + 1;
-                end
+                recv_block(got, saw_last);
+                if (!saw_last)
+                    got = {128{1'bx}};
+                if (use_ct)
+                    dec_result[received] = got;
+                else
+                    enc_result[received] = got;
+                received = received + 1;
             end
         end
     join
@@ -188,7 +223,9 @@ initial begin
 
     tb_key_valid = 0;
     tb_data_in_valid = 0;
-    tb_data_in = 128'h0;
+    tb_data_in_last = 0;
+    tb_data_in_keep = {TB_KW{1'b0}};
+    tb_data_in = {TB_DW{1'b0}};
     tb_mode = 0;
     tb_key = 128'h0;
     tb_data_out_ready = 1'b1;
@@ -200,8 +237,9 @@ initial begin
     tb_key = vec_key[0];
     tb_key_valid = 1;
     @(posedge tb_clk);
+    #1;
     tb_key_valid = 0;
-    while (!tb_key_ready) @(posedge tb_clk);
+    while (!tb_data_in_ready) @(posedge tb_clk);
     repeat(3) @(posedge tb_clk);
 
     // ---------------------------------------------------------------
@@ -209,7 +247,7 @@ initial begin
     // ---------------------------------------------------------------
     $display("[%0t] Starting continuous ENCRYPTION stream (%0d blocks)...", $time, NUM_VECTORS);
     tb_mode = 1'b0;
-    stream_blocks(vec_plaintext, enc_result);
+    stream_blocks(1'b0);
 
     for (v = 0; v < NUM_VECTORS; v = v + 1) begin
         if (enc_result[v] === vec_ciphertext[v]) begin
@@ -229,7 +267,7 @@ initial begin
     // ---------------------------------------------------------------
     $display("[%0t] Starting continuous DECRYPTION stream (%0d blocks)...", $time, NUM_VECTORS);
     tb_mode = 1'b1;
-    stream_blocks(vec_ciphertext, dec_result);
+    stream_blocks(1'b1);
 
     for (v = 0; v < NUM_VECTORS; v = v + 1) begin
         if (dec_result[v] === vec_plaintext[v]) begin

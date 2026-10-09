@@ -5,7 +5,11 @@
 // Based on FIPS-197 Section 5.2 and 5.3.5
 // =============================================================================
 
-module key_schedule (
+// DECRYPT=0: encryption round keys only (encrypt core).
+// DECRYPT=1: also derive the inverse round keys (decrypt core).
+module key_schedule #(
+    parameter DECRYPT = 1
+) (
     input  wire         clk,
     input  wire         rst_n,
     input  wire [127:0] key,
@@ -91,10 +95,16 @@ assign new_word = (subword ^ {get_rcon(round_cnt), 24'h000000}) ^ w[round_cnt * 
 // =============================================================================
 reg  [31:0] imc_col_in;
 wire [31:0] imc_col_out;
-inv_mix_columns imc_inst (
-    .col_in(imc_col_in),
-    .col_out(imc_col_out)
-);
+generate
+if (DECRYPT != 0) begin : g_imc
+    inv_mix_columns imc_inst (
+        .col_in(imc_col_in),
+        .col_out(imc_col_out)
+    );
+end else begin : g_no_imc
+    assign imc_col_out = 32'h0;
+end
+endgenerate
 
 // Decryption key generation working registers
 reg [3:0] dec_round;       // Which decryption round key (1..9) is being built
@@ -186,17 +196,22 @@ always @(posedge clk or negedge rst_n) begin
                 for (j = 0; j < 11; j = j + 1) begin
                     round_key_enc[j*128 +: 128] <= {w[j*4], w[j*4+1], w[j*4+2], w[j*4+3]};
                 end
-                // Decryption key[10] = Encryption key[0], key[0] = Encryption key[10]
-                round_key_dec[10*128 +: 128] <= {w[0], w[1], w[2], w[3]};
-                round_key_dec[0*128 +: 128]  <= {w[40], w[41], w[42], w[43]};
+                if (DECRYPT != 0) begin
+                    // Decryption key[10] = Encryption key[0], key[0] = Encryption key[10]
+                    round_key_dec[10*128 +: 128] <= {w[0], w[1], w[2], w[3]};
+                    round_key_dec[0*128 +: 128]  <= {w[40], w[41], w[42], w[43]};
 
-                // Kick off InvMixColumns pipeline for decryption round key 1,
-                // derived from encryption round key 9 (words 36..39)
-                dec_round <= 4'd1;
-                dec_src_key <= {w[36], w[37], w[38], w[39]};
-                dec_word_stage <= 2'd0;
-                imc_col_in <= w[36];
-                state <= KEY_DEC_WAIT;
+                    // Kick off InvMixColumns pipeline for decryption round key 1,
+                    // derived from encryption round key 9 (words 36..39)
+                    dec_round <= 4'd1;
+                    dec_src_key <= {w[36], w[37], w[38], w[39]};
+                    dec_word_stage <= 2'd0;
+                    imc_col_in <= w[36];
+                    state <= KEY_DEC_WAIT;
+                end else begin
+                    state <= KEY_DONE;
+                    key_ready <= 1'b1;
+                end
             end
 
             KEY_DEC_WAIT: begin

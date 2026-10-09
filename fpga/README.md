@@ -54,25 +54,27 @@ vivado -mode batch -source vivado_build.tcl
 - `clk`: System clock (100 MHz recommended)
 - `rst_n`: Active-low asynchronous reset
 - `key[127:0]`: 128-bit AES key
-- `key_valid`: Pulsed high to trigger key expansion
-- `mode`: 0 = encrypt, 1 = decrypt (ignored in CTR mode)
+- `key_valid`: High to latch `key`. The core installs that key once the cipher is idle; there is no `key_ready` pin.
 - `op_mode[1:0]`: Block cipher mode select — 00=ECB, 01=CBC, 10=CTR
+- parameter `mode`: 0 = encrypt instance (also used for CTR decrypt), 1 = decrypt instance. Only one pipeline is instantiated.
 - `iv[127:0]`: Initial IV (CBC) / initial counter value (CTR); ignored in ECB
-- `iv_valid`: Pulsed high to load `iv`; only sampled when `iv_ready` is high
-- `data_in[127:0]`: Input data (plaintext or ciphertext)
-- `data_in_valid`: Input data valid signal
+- `iv_valid`: High to latch `iv`. The core writes it into the chain register once idle; there is no `iv_ready` pin.
+- `data_in[DATA_WIDTH-1:0]`: Input data. `DATA_WIDTH` is 32 (default) or 64
+- `data_in_valid`: Input data valid
+- `data_in_last`: Last beat of this AES block (may end the block early)
+- `data_in_keep[DATA_WIDTH/8-1:0]`: Byte enable, `keep[i]` qualifies `data_in[8*i +: 8]`
 - `data_out_ready`: Downstream ready to receive
 
 ### Outputs
-- `key_ready`: High when round keys are ready
-- `iv_ready`: High when the pipeline is fully drained and a new `iv` can be loaded
 - `data_in_ready`: High when module can accept new data
-- `data_out[127:0]`: Output data
+- `data_out[DATA_WIDTH-1:0]`: Output data
 - `data_out_valid`: High when output data is valid
+- `data_out_last`: Last beat corresponding to `data_in_last`
+- `data_out_keep[DATA_WIDTH/8-1:0]`: Byte enable of the output beat
 
 ## Performance
 
-- **Throughput**: 1 block per cycle for ECB, CTR, and CBC-decrypt (128 bits/cycle).
+- **Throughput**: external bus is `DATA_WIDTH` bits/cycle (default 32). The internal pipeline is still 1 AES block/cycle for ECB, CTR, and CBC-decrypt once a block is packed.
   CBC-encrypt is inherently serial (each block depends on the previous
   block's ciphertext) and only reaches ~1 block per pipeline latency (11
   cycles).

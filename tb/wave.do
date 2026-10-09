@@ -11,7 +11,8 @@ add wave -noupdate /aes128_top_tb/tb_clk
 add wave -noupdate /aes128_top_tb/tb_rst_n
 add wave -noupdate /aes128_top_tb/tb_mode
 add wave -noupdate /aes128_top_tb/tb_key_valid
-add wave -noupdate /aes128_top_tb/tb_key_ready
+add wave -noupdate /aes128_top_tb/dut_enc/key_load
+add wave -noupdate /aes128_top_tb/dut_enc/key_expand_busy
 add wave -noupdate /aes128_top_tb/tb_data_in_valid
 add wave -noupdate /aes128_top_tb/tb_data_in_ready
 add wave -noupdate /aes128_top_tb/tb_data_out_valid
@@ -22,20 +23,18 @@ add wave -noupdate -radix hexadecimal /aes128_top_tb/tb_data_in
 add wave -noupdate -radix hexadecimal /aes128_top_tb/tb_data_out
 
 add wave -noupdate -divider {Key Schedule}
-add wave -noupdate /aes128_top_tb/dut/key_sched/state
-add wave -noupdate /aes128_top_tb/dut/key_sched/key_ready
+add wave -noupdate /aes128_top_tb/dut_enc/key_sched/state
+add wave -noupdate /aes128_top_tb/dut_enc/key_sched/key_ready
 
 add wave -noupdate -divider {Encryption Pipeline}
-add wave -noupdate /aes128_top_tb/dut/enc_pipe/stall
-add wave -noupdate /aes128_top_tb/dut/enc_pipe/pipe_en
-add wave -noupdate /aes128_top_tb/dut/enc_pipe/data_in_ready
-add wave -noupdate /aes128_top_tb/dut/enc_pipe/data_out_valid
+add wave -noupdate /aes128_top_tb/dut_enc/g_enc/enc_pipe/pipe_en
+add wave -noupdate /aes128_top_tb/dut_enc/g_enc/enc_pipe/data_in_ready
+add wave -noupdate /aes128_top_tb/dut_enc/g_enc/enc_pipe/data_out_valid
 
 add wave -noupdate -divider {Decryption Pipeline}
-add wave -noupdate /aes128_top_tb/dut/dec_pipe/stall
-add wave -noupdate /aes128_top_tb/dut/dec_pipe/pipe_en
-add wave -noupdate /aes128_top_tb/dut/dec_pipe/data_in_ready
-add wave -noupdate /aes128_top_tb/dut/dec_pipe/data_out_valid
+add wave -noupdate /aes128_top_tb/dut_dec/g_dec/dec_pipe/pipe_en
+add wave -noupdate /aes128_top_tb/dut_dec/g_dec/dec_pipe/data_in_ready
+add wave -noupdate /aes128_top_tb/dut_dec/g_dec/dec_pipe/data_out_valid
 
 # Configuration
 TreeUpdate [SetDefaultTree]

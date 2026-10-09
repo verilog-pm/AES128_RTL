@@ -7,6 +7,10 @@
 
 module aes128_top_tb;
 
+localparam TB_DW = 32;
+localparam TB_KW = TB_DW / 8;
+localparam TB_BEATS = 128 / TB_DW;
+
 // =============================================================================
 // Clock and reset
 // =============================================================================
@@ -29,37 +33,76 @@ end
 // =============================================================================
 reg  [127:0] tb_key;
 reg          tb_key_valid;
-wire         tb_key_ready;
-reg          tb_mode;
-reg  [1:0]   tb_op_mode;   // 00=ECB, 01=CBC, 10=CTR (this testbench uses ECB)
+reg          tb_mode;       // selects which parameterized core is observed
+reg  [1:0]   tb_op_mode;    // 00=ECB, 01=CBC, 10=CTR (this testbench uses ECB)
 reg  [127:0] tb_iv;
 reg          tb_iv_valid;
-wire         tb_iv_ready;
-reg  [127:0] tb_data_in;
+reg  [TB_DW-1:0] tb_data_in;
 reg          tb_data_in_valid;
+reg          tb_data_in_last;
+reg  [TB_KW-1:0] tb_data_in_keep;
 wire         tb_data_in_ready;
-wire [127:0] tb_data_out;
+wire [TB_DW-1:0] tb_data_out;
 wire         tb_data_out_valid;
+wire         tb_data_out_last;
+wire [TB_KW-1:0] tb_data_out_keep;
 reg          tb_data_out_ready;
 
-aes128_top dut (
+wire         enc_ready, dec_ready;
+wire         enc_out_valid, dec_out_valid;
+wire         enc_last, dec_last;
+wire [TB_DW-1:0] enc_out, dec_out;
+wire [TB_KW-1:0] enc_keep, dec_keep;
+// CTR (both directions) lives on the encrypt core.
+wire         use_enc = (tb_mode == 1'b0) || (tb_op_mode == 2'b10);
+
+aes128_top #(.mode(1'b0)) dut_enc (
     .clk(tb_clk),
     .rst_n(tb_rst_n),
     .key(tb_key),
     .key_valid(tb_key_valid),
-    .key_ready(tb_key_ready),
-    .mode(tb_mode),
     .op_mode(tb_op_mode),
     .iv(tb_iv),
     .iv_valid(tb_iv_valid),
-    .iv_ready(tb_iv_ready),
     .data_in(tb_data_in),
-    .data_in_valid(tb_data_in_valid),
-    .data_in_ready(tb_data_in_ready),
-    .data_out(tb_data_out),
-    .data_out_valid(tb_data_out_valid),
+    .data_in_valid(tb_data_in_valid && use_enc),
+    .data_in_last(tb_data_in_last && use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(enc_ready),
+    .data_out(enc_out),
+    .data_out_valid(enc_out_valid),
+    .data_out_last(enc_last),
+    .data_out_keep(enc_keep),
     .data_out_ready(tb_data_out_ready)
 );
+
+aes128_top #(.mode(1'b1)) dut_dec (
+    .clk(tb_clk),
+    .rst_n(tb_rst_n),
+    .key(tb_key),
+    .key_valid(tb_key_valid),
+    .op_mode(tb_op_mode),
+    .iv(tb_iv),
+    .iv_valid(tb_iv_valid),
+    .data_in(tb_data_in),
+    .data_in_valid(tb_data_in_valid && !use_enc),
+    .data_in_last(tb_data_in_last && !use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(dec_ready),
+    .data_out(dec_out),
+    .data_out_valid(dec_out_valid),
+    .data_out_last(dec_last),
+    .data_out_keep(dec_keep),
+    .data_out_ready(tb_data_out_ready)
+);
+
+assign tb_data_in_ready  = use_enc ? enc_ready : dec_ready;
+assign tb_data_out       = use_enc ? enc_out : dec_out;
+assign tb_data_out_valid = use_enc ? enc_out_valid : dec_out_valid;
+assign tb_data_out_last  = use_enc ? enc_last : dec_last;
+assign tb_data_out_keep  = use_enc ? enc_keep : dec_keep;
+
+`include "aes_stream_tasks.vh"
 
 // =============================================================================
 // Test vectors from FIPS-197
@@ -93,25 +136,11 @@ task send_and_capture;
     input  [127:0] in_data;
     output [127:0] out_data;
     output         got_valid;
-    integer wait_cycles;
+    reg            saw_last;
 begin
-    tb_data_in = in_data;
-    tb_data_in_valid = 1;
-    @(posedge tb_clk);
-    while (!tb_data_in_ready) @(posedge tb_clk);
-    tb_data_in_valid = 0;
-
-    got_valid = 0;
-    out_data  = 128'h0;
-    wait_cycles = 0;
-    while (!got_valid && wait_cycles < 50) begin
-        @(posedge tb_clk);
-        wait_cycles = wait_cycles + 1;
-        if (tb_data_out_valid) begin
-            got_valid = 1;
-            out_data  = tb_data_out;
-        end
-    end
+    send_block(in_data, 1'b1);
+    recv_block(out_data, saw_last);
+    got_valid = saw_last && (out_data !== {128{1'bx}});
 end
 endtask
 
@@ -127,7 +156,9 @@ initial begin
     // Initialize control signals
     tb_key_valid = 0;
     tb_data_in_valid = 0;
-    tb_data_in = 128'h0;
+    tb_data_in_last = 0;
+    tb_data_in_keep = {TB_KW{1'b0}};
+    tb_data_in = {TB_DW{1'b0}};
     tb_mode = 0;
     tb_op_mode = 2'b00;  // ECB
     tb_iv = 128'h0;
@@ -147,12 +178,14 @@ initial begin
     tb_key = test_key;
     tb_key_valid = 1;
     @(posedge tb_clk);
+    #1;
     tb_key_valid = 0;
     
-    // Wait for key_ready
-    while (!tb_key_ready) @(posedge tb_clk);
+    // key_valid only latches the key. data_in_ready rises after the cipher
+    // is idle and round-key expansion has finished.
+    while (!tb_data_in_ready) @(posedge tb_clk);
     $display("  Key loaded successfully");
-    #20;
+    repeat (2) @(posedge tb_clk);
     
     $display("\n--- Test 1: Encryption ---");
     tb_mode = 1'b0;

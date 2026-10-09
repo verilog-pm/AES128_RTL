@@ -12,10 +12,15 @@
 # Byte order: 128-bit bus <-> bytes conversions are big-endian, matching
 # tb/gen_vectors.py and tb/gen_mode_vectors.py.
 #
-# Driver notes (aes128_top contract):
-#   * key_valid / iv_valid are single-cycle pulses; key load waits for
-#     key_ready, IV load only while iv_ready is high (pipeline drained).
-#   * mode / op_mode only change while idle.
+# Driver notes:
+#   The DUT is aes128_cocotb_harness, which muxes two aes128_top instances
+#   (mode parameter 0 and 1). aes128_top itself no longer has a mode port.
+#   * key_valid / iv_valid are single-cycle pulses. Each only latches its
+#     value; the core applies it once the cipher is idle. data_in_ready stays
+#     low until the new key or IV is installed. There is no key_ready or
+#     iv_ready pin.
+#   * The harness `mode` pin selects the encrypt or decrypt core. CTR always
+#     uses the encrypt core. op_mode changes only while that core is idle.
 #   * Data blocks go through the valid/ready handshake. Random gaps are
 #     inserted on the input (data_in_valid low). data_out_ready stays 1:
 #     the pipeline pops on the edge that raises data_out_valid, while
@@ -28,6 +33,7 @@
 # =============================================================================
 import os
 import random
+from pathlib import Path
 
 import cocotb
 from cocotb.clock import Clock
@@ -95,6 +101,52 @@ def block_to_bytes(v):
     return v.to_bytes(16, "big")
 
 
+def _block_hex(block):
+    """16-byte block or 128-bit int as 32 lowercase hex digits."""
+    if isinstance(block, int):
+        return f"{block:032x}"
+    return block.hex()
+
+
+_DATA_LOG = Path(__file__).resolve().parent / "sim_data.log"
+_data_log_started = False
+
+
+def _log_vectors(mode_name, mi, path_name, key, iv,
+                 before_enc, after_enc, before_dec, after_dec):
+    """Append one message's encrypt/decrypt bytes for sim.log."""
+    global _data_log_started
+    if not _data_log_started:
+        _DATA_LOG.write_text(
+            "AES-128 加解密数据（每个 128-bit 块一行，大端 hex）\n"
+            "加密前 = 送入加密的明文；加密后 = 加密得到的密文；\n"
+            "解密前 = 送入解密的密文；解密后 = 解密得到的明文。\n\n",
+            encoding="utf-8",
+        )
+        _data_log_started = True
+
+    def _lines(blocks):
+        if not blocks:
+            return "    (无数据)"
+        return "\n".join(
+            f"    [{i:02d}] {_block_hex(b)}" for i, b in enumerate(blocks)
+        )
+
+    iv_line = f"  iv:  {iv.hex()}\n" if iv is not None else ""
+    text = (
+        f"[{mode_name}] message {mi}  {path_name}\n"
+        f"  key: {key.hex()}\n"
+        f"{iv_line}"
+        f"  加密前:\n{_lines(before_enc)}\n"
+        f"  加密后:\n{_lines(after_enc)}\n"
+        f"  解密前:\n{_lines(before_dec)}\n"
+        f"  解密后:\n{_lines(after_dec)}\n"
+        "\n"
+    )
+    with _DATA_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 # ---------------------------------------------------------------------------
 # pycryptodome golden model
 # ---------------------------------------------------------------------------
@@ -136,6 +188,8 @@ class AesDriver:
         dut.iv_valid.value = 0
         dut.data_in.value = 0
         dut.data_in_valid.value = 0
+        dut.data_in_last.value = 0
+        dut.data_in_keep.value = 0
         dut.data_out_ready.value = 1
         dut.mode.value = 0
         dut.op_mode.value = OP_ECB
@@ -146,26 +200,36 @@ class AesDriver:
             await RisingEdge(dut.clk)
 
     async def wait_idle(self):
-        """Wait until pipeline and output FIFO are fully drained (iv_ready)."""
+        """Wait until no input is offered and no output appears for a while.
+
+        Pipeline latency is about 12 cycles, so a quiet stretch longer than
+        that means nothing is left in flight. iv_ready is no longer a port.
+        """
         dut = self.dut
+        quiet = 0
         for _ in range(IDLE_TIMEOUT_CYCLES):
             await RisingEdge(dut.clk)
             await ReadOnly()
-            if int(dut.iv_ready.value):
-                await Timer(1, unit="ns")  # leave ReadOnly before the caller drives
-                return
+            if int(dut.data_out_valid.value) or int(dut.data_in_valid.value):
+                quiet = 0
+            else:
+                quiet += 1
+                if quiet >= 20:
+                    await Timer(1, unit="ns")  # leave ReadOnly before the caller drives
+                    return
         raise TimeoutError(
-            "iv_ready never asserted: pipeline did not drain "
-            f"(in_flight={int(dut.in_flight_count.value)} "
-            f"out_valid={int(dut.data_out_valid.value)} "
+            "pipeline did not drain "
+            f"(out_valid={int(dut.data_out_valid.value)} "
             f"out_ready={int(dut.data_out_ready.value)} "
-            f"enc_fifo={int(dut.enc_pipe.fifo_count.value)} "
-            f"dec_fifo={int(dut.dec_pipe.fifo_count.value)} "
-            f"busy={int(dut.cbc_enc_busy.value)})"
+            f"in_ready={int(dut.data_in_ready.value)})"
         )
 
     async def load_key(self, key_int):
-        """Single-cycle key_valid pulse, then wait for key_ready."""
+        """Single-cycle key_valid pulse, then wait until the new key is in use.
+
+        The top latches the key while key_valid is high and expands it only
+        once the cipher is idle. data_in_ready stays low across that update.
+        """
         dut = self.dut
         await RisingEdge(dut.clk)
         dut.key.value = key_int
@@ -174,79 +238,121 @@ class AesDriver:
         dut.key_valid.value = 0
         for _ in range(KEY_TIMEOUT_CYCLES):
             await RisingEdge(dut.clk)
-            if dut.key_ready.value:
+            if dut.data_in_ready.value:
                 return
-        raise TimeoutError("key_ready never asserted after key_valid pulse")
+        raise TimeoutError("data_in_ready never asserted after key_valid pulse")
 
     async def configure(self, op, encrypt):
-        """Set op_mode / mode. RTL requires these to change only while idle."""
+        """Select op_mode and which parameterized core the harness uses.
+
+        CTR decrypt stays on the encrypt core. Change these only while idle.
+        """
         dut = self.dut
         dut.op_mode.value = op
         dut.mode.value = 0 if encrypt else 1
         await RisingEdge(dut.clk)
 
     async def load_iv(self, iv_int):
-        """Single-cycle iv_valid pulse while iv_ready is high."""
+        """Single-cycle iv_valid pulse. The core latches iv and installs it when idle."""
         dut = self.dut
         await RisingEdge(dut.clk)
-        if not dut.iv_ready.value:
-            raise RuntimeError("load_iv called while pipeline is not idle")
         dut.iv.value = iv_int
         dut.iv_valid.value = 1
         await RisingEdge(dut.clk)
         dut.iv_valid.value = 0
 
-    async def send_blocks(self, blocks):
-        """Stream blocks in with valid/ready handshake + random input gaps."""
+    def _geom(self):
+        width = int(self.dut.DATA_WIDTH.value)
+        beats = 128 // width
+        full_keep = (1 << (width // 8)) - 1
+        return width, beats, full_keep
+
+    @staticmethod
+    def _split_block(block, width, beats):
+        mask = (1 << width) - 1
+        return [((block >> (128 - (b + 1) * width)) & mask) for b in range(beats)]
+
+    @staticmethod
+    def _join_beats(beats, width):
+        mask = (1 << width) - 1
+        value = 0
+        for b, beat in enumerate(beats):
+            value |= (beat & mask) << (128 - (b + 1) * width)
+        return value
+
+    async def _send_beat(self, beat, keep, last):
         dut = self.dut
+        _drive(dut.data_in, beat)
+        _drive(dut.data_in_keep, keep)
+        _drive(dut.data_in_last, 1 if last else 0)
+        _drive(dut.data_in_valid, 1)
+        for _ in range(HANDSHAKE_TIMEOUT_CYCLES):
+            await ReadOnly()
+            if dut.data_in_ready.value:
+                break
+            await RisingEdge(dut.clk)
+        else:
+            _drive(dut.data_in_valid, 0)
+            _drive(dut.data_in_last, 0)
+            raise TimeoutError("data_in_ready never asserted")
+        await RisingEdge(dut.clk)
+
+    async def send_blocks(self, blocks):
+        """Stream each 128-bit block as DATA_WIDTH beats. last marks the
+        final beat of the message. Gaps are inserted between blocks."""
+        dut = self.dut
+        width, nbeats, full_keep = self._geom()
         for idx, blk in enumerate(blocks):
-            dut.data_in.value = blk
-            dut.data_in_valid.value = 1
-            # The value settled at the end of a timestep is what the RTL
-            # samples at the next posedge; ReadOnly avoids post-edge races.
-            for _ in range(HANDSHAKE_TIMEOUT_CYCLES):
-                await ReadOnly()
-                if dut.data_in_ready.value:
-                    break
-                await RisingEdge(dut.clk)
-            else:
-                dut.data_in_valid.value = 0
-                raise TimeoutError(
-                    f"data_in_ready never asserted for block {idx}"
-                    f" of {len(blocks)}")
-            await RisingEdge(dut.clk)  # handshake fires at this posedge
+            beats = self._split_block(blk, width, nbeats)
+            for b, beat in enumerate(beats):
+                last = (idx == len(blocks) - 1) and (b == nbeats - 1)
+                await self._send_beat(beat, full_keep, last)
             if idx < len(blocks) - 1 and rng.random() < IN_GAP_PROBABILITY:
-                # random gap: deassert valid for a few cycles (backpressure)
-                dut.data_in_valid.value = 0
+                _drive(dut.data_in_valid, 0)
+                _drive(dut.data_in_last, 0)
                 for _ in range(rng.randint(1, IN_GAP_MAX_CYCLES)):
                     await RisingEdge(dut.clk)
-        dut.data_in_valid.value = 0
+        _drive(dut.data_in_valid, 0)
+        _drive(dut.data_in_last, 0)
 
     async def recv_blocks(self, count):
-        """Collect `count` output blocks.
+        """Collect `count` output blocks, reassembled from narrow beats.
 
-        data_out_ready stays 1. The pipeline pops a block on the same edge
-        that raises data_out_valid, while in_flight_count consumes that
-        block one edge later. Pulling ready low between those edges either
-        drops the consume (counter stuck) or, if valid is held high across
-        the stall, counts it twice (counter wraps). Input-side gaps still
-        exercise pipeline backpressure.
+        data_out_ready stays 1. Each accepted beat is visible for one cycle.
+        data_out_last is high only on the last beat of the message, and every
+        beat of these full blocks carries keep=all-ones.
         """
         dut = self.dut
-        got = []
+        width, nbeats, full_keep = self._geom()
+        need = count * nbeats
+        beats = []
+        lasts = []
+        keeps = []
         budget = RECV_TIMEOUT_CYCLES
         _drive(dut.data_out_ready, 1)
-        while len(got) < count:
+        while len(beats) < need:
             await RisingEdge(dut.clk)
             budget -= 1
             if budget < 0:
                 raise TimeoutError(
-                    f"received only {len(got)}/{count} output blocks")
+                    f"received only {len(beats)}/{need} output beats "
+                    f"({len(beats) // nbeats} blocks)")
             await ReadOnly()
             if int(dut.data_out_valid.value):
-                got.append(int(dut.data_out.value))
+                beats.append(int(dut.data_out.value))
+                lasts.append(int(dut.data_out_last.value))
+                keeps.append(int(dut.data_out_keep.value))
         await Timer(1, unit="ns")
-        return got
+        for i, (last, keep) in enumerate(zip(lasts, keeps)):
+            if bool(last) != (i == need - 1):
+                raise AssertionError(
+                    f"data_out_last={last} on beat {i}, "
+                    f"expected {int(i == need - 1)}")
+            if keep != full_keep:
+                raise AssertionError(
+                    f"data_out_keep={keep:#x} on beat {i}, expected {full_keep:#x}")
+        return [self._join_beats(beats[i * nbeats:(i + 1) * nbeats], width)
+                for i in range(count)]
 
     async def stream(self, blocks):
         """Send blocks and concurrently collect len(blocks) output blocks."""
@@ -289,9 +395,11 @@ async def run_message(drv, mode_name, op, mi, key, iv, pt_blocks):
     if op != OP_ECB:
         await drv.load_iv(iv_int)
     rtl_ct = await drv.stream(pt_ints)
-    py_pt = py_cipher(op, key, iv,
-                      [block_to_bytes(v) for v in rtl_ct], encrypt=False)
-    rtl_ct_hex = " ".join(f"{v:032x}" for v in rtl_ct)
+    rtl_ct_bytes = [block_to_bytes(v) for v in rtl_ct]
+    py_pt = py_cipher(op, key, iv, rtl_ct_bytes, encrypt=False)
+    _log_vectors(mode_name, mi, "RTL加密 -> Python解密", key, iv,
+                 pt_blocks, rtl_ct_bytes, rtl_ct_bytes, py_pt)
+    rtl_ct_hex = " ".join(b.hex() for b in rtl_ct_bytes)
     _check_blocks(mode_name, "RTL-enc->PY-dec", mi, pt_blocks, py_pt,
                   key, iv, f"rtl_ct: {rtl_ct_hex}")
 
@@ -302,9 +410,11 @@ async def run_message(drv, mode_name, op, mi, key, iv, pt_blocks):
     if op != OP_ECB:
         await drv.load_iv(iv_int)
     rtl_pt = await drv.stream([bytes_to_block(c) for c in py_ct])
+    rtl_pt_bytes = [block_to_bytes(v) for v in rtl_pt]
+    _log_vectors(mode_name, mi, "Python加密 -> RTL解密", key, iv,
+                 pt_blocks, py_ct, py_ct, rtl_pt_bytes)
     py_ct_hex = " ".join(c.hex() for c in py_ct)
-    _check_blocks(mode_name, "PY-enc->RTL-dec", mi, pt_blocks,
-                  [block_to_bytes(v) for v in rtl_pt],
+    _check_blocks(mode_name, "PY-enc->RTL-dec", mi, pt_blocks, rtl_pt_bytes,
                   key, iv, f"py_ct: {py_ct_hex}")
 
 

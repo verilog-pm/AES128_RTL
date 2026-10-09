@@ -20,11 +20,13 @@ module aes128_pipeline_dec (
                                        // XORed with the AES core output once it
                                        // finally emerges from the pipeline.
                                        // Unused (tie to 0) for ECB.
+    input  wire [19:0]  meta_in,      // {packet_last, beat_count[2:0], byte_keep[15:0]}
     input  wire [1407:0] round_keys,  // 11 * 128 = 1408 bits for decryption round keys
     input  wire         key_ready,
     output reg  [127:0] data_out,
     output reg          data_out_valid,
     output reg  [127:0] aux_out,      // aux_in delayed by the same latency as data_out
+    output reg  [19:0]  meta_out,
     input  wire         data_out_ready
 );
 
@@ -34,6 +36,7 @@ module aes128_pipeline_dec (
 reg [127:0] pipe_data [0:10];
 reg         pipe_valid [0:10];
 reg [127:0] pipe_aux  [0:10];  // shadow pipeline carrying aux_in alongside data
+reg [19:0]  pipe_meta [0:10];
 
 // ============================================================================
 // Control signals - Optimized for continuous throughput
@@ -41,6 +44,7 @@ reg [127:0] pipe_aux  [0:10];  // shadow pipeline carrying aux_in alongside data
 // Output FIFO signals
 reg  [127:0] fifo_data [0:15];
 reg  [127:0] fifo_aux  [0:15];
+reg  [19:0]  fifo_meta [0:15];
 reg          fifo_valid [0:15];
 reg  [3:0]   fifo_wr_ptr;
 reg  [3:0]   fifo_rd_ptr;
@@ -461,10 +465,12 @@ always @(posedge clk or negedge rst_n) begin
             pipe_data[i] <= 128'h0;
             pipe_valid[i] <= 1'b0;
             pipe_aux[i] <= 128'h0;
+            pipe_meta[i] <= 20'h0;
         end
         for (i = 0; i < 16; i = i + 1) begin
             fifo_data[i] <= 128'h0;
             fifo_aux[i] <= 128'h0;
+            fifo_meta[i] <= 20'h0;
             fifo_valid[i] <= 1'b0;
         end
         fifo_wr_ptr <= 4'h0;
@@ -473,6 +479,7 @@ always @(posedge clk or negedge rst_n) begin
         data_out <= 128'h0;
         data_out_valid <= 1'b0;
         aux_out <= 128'h0;
+        meta_out <= 20'h0;
     end else begin
         // Pipeline stage updates - always advance unless FIFO is full
         if (pipe_en) begin
@@ -480,47 +487,58 @@ always @(posedge clk or negedge rst_n) begin
             pipe_data[0] <= data_in ^ round_keys[0 +: 128];
             pipe_valid[0] <= data_in_valid;
             pipe_aux[0] <= aux_in;
+            pipe_meta[0] <= meta_in;
             
             // Stages 1-10
             pipe_data[1] <= s1_out;
             pipe_valid[1] <= pipe_valid[0];
             pipe_aux[1] <= pipe_aux[0];
+            pipe_meta[1] <= pipe_meta[0];
             
             pipe_data[2] <= s2_out;
             pipe_valid[2] <= pipe_valid[1];
             pipe_aux[2] <= pipe_aux[1];
+            pipe_meta[2] <= pipe_meta[1];
             
             pipe_data[3] <= s3_out;
             pipe_valid[3] <= pipe_valid[2];
             pipe_aux[3] <= pipe_aux[2];
+            pipe_meta[3] <= pipe_meta[2];
             
             pipe_data[4] <= s4_out;
             pipe_valid[4] <= pipe_valid[3];
             pipe_aux[4] <= pipe_aux[3];
+            pipe_meta[4] <= pipe_meta[3];
             
             pipe_data[5] <= s5_out;
             pipe_valid[5] <= pipe_valid[4];
             pipe_aux[5] <= pipe_aux[4];
+            pipe_meta[5] <= pipe_meta[4];
             
             pipe_data[6] <= s6_out;
             pipe_valid[6] <= pipe_valid[5];
             pipe_aux[6] <= pipe_aux[5];
+            pipe_meta[6] <= pipe_meta[5];
             
             pipe_data[7] <= s7_out;
             pipe_valid[7] <= pipe_valid[6];
             pipe_aux[7] <= pipe_aux[6];
+            pipe_meta[7] <= pipe_meta[6];
             
             pipe_data[8] <= s8_out;
             pipe_valid[8] <= pipe_valid[7];
             pipe_aux[8] <= pipe_aux[7];
+            pipe_meta[8] <= pipe_meta[7];
             
             pipe_data[9] <= s9_out;
             pipe_valid[9] <= pipe_valid[8];
             pipe_aux[9] <= pipe_aux[8];
+            pipe_meta[9] <= pipe_meta[8];
             
             pipe_data[10] <= s10_out;
             pipe_valid[10] <= pipe_valid[9];
             pipe_aux[10] <= pipe_aux[9];
+            pipe_meta[10] <= pipe_meta[9];
         end else begin
             // Pipeline stalled, but clear pipe_valid[10] after writing to FIFO
             if (fifo_wr_en) begin
@@ -532,6 +550,7 @@ always @(posedge clk or negedge rst_n) begin
         if (fifo_wr_en) begin
             fifo_data[fifo_wr_ptr] <= pipe_data[10];
             fifo_aux[fifo_wr_ptr] <= pipe_aux[10];
+            fifo_meta[fifo_wr_ptr] <= pipe_meta[10];
             fifo_valid[fifo_wr_ptr] <= 1'b1;
             fifo_wr_ptr <= fifo_wr_ptr + 1'b1;
         end
@@ -541,6 +560,7 @@ always @(posedge clk or negedge rst_n) begin
         if (!fifo_empty) begin
             data_out <= fifo_data[fifo_rd_ptr];
             aux_out <= fifo_aux[fifo_rd_ptr];
+            meta_out <= fifo_meta[fifo_rd_ptr];
             data_out_valid <= 1'b1;
         end else begin
             data_out_valid <= 1'b0;

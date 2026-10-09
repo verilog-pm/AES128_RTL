@@ -2,7 +2,7 @@
 """
 Build and run the cocotb AES-128 cross-check simulation.
 
-Compiles all of ../../rtl with the cocotb runner (top module aes128_top,
+Compiles all of ../../rtl plus aes128_cocotb_harness (cocotb top,
 timescale 1ns/1ps) and runs test_aes_crosscheck.py, which cross-validates
 ECB / CBC / CTR in both directions against pycryptodome:
 
@@ -20,6 +20,8 @@ Usage:
     python run_sim.py            (from this directory)
 
 The full build and test transcript is written to sim.log in this directory.
+The log's data section lists, for every message, the bytes before
+encryption, after encryption, before decryption, and after decryption.
 Icarus also writes a VCD waveform to aes128_top.vcd in this directory.
 The console only prints the log path, the VCD path, and the pass/fail summary.
 
@@ -38,8 +40,9 @@ BUILD_DIR = HERE / "sim_build"
 BUILD_LOG = BUILD_DIR / "build.log"
 TEST_LOG = BUILD_DIR / "test.log"
 RUN_LOG = HERE / "sim.log"
+DATA_LOG = HERE / "sim_data.log"
 VCD_PATH = HERE / "aes128_top.vcd"
-TOP_MODULE = "aes128_top"
+TOP_MODULE = "aes128_cocotb_harness"
 TEST_MODULE = "test_aes_crosscheck"
 MODELSIM_BIN = r"C:\modeltech64_2020.4\win64"
 
@@ -198,6 +201,10 @@ def _write_run_log(simulator, sources, summary_lines):
         f"rtl: {', '.join(src.name for src in sources)}",
         f"vcd: {VCD_PATH}",
         "",
+        "-------- data --------",
+        _read_log(DATA_LOG).replace("(no output)", "(no vector data recorded)")
+        .replace("(empty)", "(no vector data recorded)"),
+        "",
         "-------- build --------",
         _read_log(BUILD_LOG).replace(
             "(empty)",
@@ -217,10 +224,12 @@ def _write_run_log(simulator, sources, summary_lines):
 
 def main():
     sources = sorted(RTL_DIR.glob("*.v"))
+    harness = HERE / f"{TOP_MODULE}.v"
     if not sources:
         sys.exit(f"ERROR: no Verilog sources found in {RTL_DIR}")
-    if not (RTL_DIR / f"{TOP_MODULE}.v").exists():
-        sys.exit(f"ERROR: {TOP_MODULE}.v not found in {RTL_DIR}")
+    if not harness.exists():
+        sys.exit(f"ERROR: {harness} not found")
+    sources.append(harness)
 
     sim = "icarus" if shutil.which("iverilog") else "modelsim"
     if sim == "modelsim":
@@ -243,6 +252,7 @@ def main():
         print("Building...")
         _build(runner, sources)
 
+        DATA_LOG.write_text("", encoding="utf-8")
         print("Running cocotb tests...")
         try:
             _run_tests(runner)

@@ -9,6 +9,10 @@
 
 module aes128_cross_check_tb;
 
+localparam TB_DW = 32;
+localparam TB_KW = TB_DW / 8;
+localparam TB_BEATS = 128 / TB_DW;
+
 // =============================================================================
 // Parameters
 // =============================================================================
@@ -45,33 +49,72 @@ end
 // =============================================================================
 reg  [127:0] tb_key;
 reg          tb_key_valid;
-wire         tb_key_ready;
 reg          tb_mode;
-reg  [127:0] tb_data_in;
+reg  [TB_DW-1:0] tb_data_in;
 reg          tb_data_in_valid;
+reg          tb_data_in_last;
+reg  [TB_KW-1:0] tb_data_in_keep;
 wire         tb_data_in_ready;
-wire [127:0] tb_data_out;
+wire [TB_DW-1:0] tb_data_out;
 wire         tb_data_out_valid;
+wire         tb_data_out_last;
+wire [TB_KW-1:0] tb_data_out_keep;
 reg          tb_data_out_ready;
 
-aes128_top dut (
+wire         enc_ready, dec_ready;
+wire         enc_out_valid, dec_out_valid;
+wire         enc_last, dec_last;
+wire [TB_DW-1:0] enc_out, dec_out;
+wire [TB_KW-1:0] enc_keep, dec_keep;
+wire         use_enc = (tb_mode == 1'b0);
+
+aes128_top #(.mode(1'b0)) dut_enc (
     .clk(tb_clk),
     .rst_n(tb_rst_n),
     .key(tb_key),
     .key_valid(tb_key_valid),
-    .key_ready(tb_key_ready),
-    .mode(tb_mode),
-    .op_mode(2'b00),      // ECB (this testbench only cross-checks ECB)
+    .op_mode(2'b00),
     .iv(128'h0),
     .iv_valid(1'b0),
-    .iv_ready(),
     .data_in(tb_data_in),
-    .data_in_valid(tb_data_in_valid),
-    .data_in_ready(tb_data_in_ready),
-    .data_out(tb_data_out),
-    .data_out_valid(tb_data_out_valid),
+    .data_in_valid(tb_data_in_valid && use_enc),
+    .data_in_last(tb_data_in_last && use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(enc_ready),
+    .data_out(enc_out),
+    .data_out_valid(enc_out_valid),
+    .data_out_last(enc_last),
+    .data_out_keep(enc_keep),
     .data_out_ready(tb_data_out_ready)
 );
+
+aes128_top #(.mode(1'b1)) dut_dec (
+    .clk(tb_clk),
+    .rst_n(tb_rst_n),
+    .key(tb_key),
+    .key_valid(tb_key_valid),
+    .op_mode(2'b00),
+    .iv(128'h0),
+    .iv_valid(1'b0),
+    .data_in(tb_data_in),
+    .data_in_valid(tb_data_in_valid && !use_enc),
+    .data_in_last(tb_data_in_last && !use_enc),
+    .data_in_keep(tb_data_in_keep),
+    .data_in_ready(dec_ready),
+    .data_out(dec_out),
+    .data_out_valid(dec_out_valid),
+    .data_out_last(dec_last),
+    .data_out_keep(dec_keep),
+    .data_out_ready(tb_data_out_ready)
+);
+
+assign tb_data_in_ready  = use_enc ? enc_ready : dec_ready;
+assign tb_data_out       = use_enc ? enc_out : dec_out;
+assign tb_data_out_valid = use_enc ? enc_out_valid : dec_out_valid;
+assign tb_data_out_last  = use_enc ? enc_last : dec_last;
+assign tb_data_out_keep  = use_enc ? enc_keep : dec_keep;
+
+`include "aes_stream_tasks.vh"
 
 // =============================================================================
 // Vector storage: each row holds {key, plaintext, ciphertext}
@@ -106,26 +149,11 @@ task send_and_capture;
     input  [127:0] in_data;
     output [127:0] out_data;
     output         got_valid;
-    integer wait_cycles;
+    reg            saw_last;
 begin
-    @(posedge tb_clk);
-    tb_data_in = in_data;
-    tb_data_in_valid = 1;
-    @(posedge tb_clk);
-    while (!tb_data_in_ready) @(posedge tb_clk);
-    tb_data_in_valid = 0;
-
-    got_valid = 0;
-    out_data  = 128'h0;
-    wait_cycles = 0;
-    while (!got_valid && wait_cycles < 50) begin
-        @(posedge tb_clk);
-        wait_cycles = wait_cycles + 1;
-        if (tb_data_out_valid) begin
-            got_valid = 1;
-            out_data  = tb_data_out;
-        end
-    end
+    send_block(in_data, 1'b1);
+    recv_block(out_data, saw_last);
+    got_valid = saw_last && (out_data !== {128{1'bx}});
 end
 endtask
 
@@ -152,7 +180,9 @@ initial begin
 
     tb_key_valid = 0;
     tb_data_in_valid = 0;
-    tb_data_in = 128'h0;
+    tb_data_in_last = 0;
+    tb_data_in_keep = {TB_KW{1'b0}};
+    tb_data_in = {TB_DW{1'b0}};
     tb_mode = 0;
     tb_key = 128'h0;
     tb_data_out_ready = 1'b1;
@@ -169,10 +199,11 @@ initial begin
             tb_key = vec_key[v];
             tb_key_valid = 1;
             @(posedge tb_clk);
+            #1;
             tb_key_valid = 0;
-            while (!tb_key_ready) @(posedge tb_clk);
+            while (!tb_data_in_ready) @(posedge tb_clk);
             last_key = vec_key[v];
-            #20;
+            repeat (2) @(posedge tb_clk);
         end
 
         // Encryption check
