@@ -49,13 +49,11 @@ from Crypto.Util import Counter
 
 
 def _drive(sig, value):
-    """Drive a DUT input so the next posedge observes it.
+    """Drive a DUT input immediately.
 
-    cocotb 2 ``sig.value = x`` is an inertial Deposit, applied at the next
-    ReadWrite. On Icarus that ReadWrite runs after the following posedge has
-    already sampled the old value, so a ready/valid change issued from a
-    RisingEdge callback misses the edge it was meant to affect. Immediate
-    updates the net before the simulator continues.
+    Call this at least 1 ns after the rising edge that should keep the
+    previous value. A write inside the RisingEdge callback itself is still
+    visible to Icarus when it samples that edge.
     """
     if Immediate is None:
         sig.value = value
@@ -280,38 +278,53 @@ class AesDriver:
             value |= (beat & mask) << (128 - (b + 1) * width)
         return value
 
-    async def _send_beat(self, beat, keep, last):
+    async def _wait_ready(self):
+        """Posedge, then 1 ns, matching the Verilog tasks' @(posedge); #1."""
         dut = self.dut
+        for _ in range(HANDSHAKE_TIMEOUT_CYCLES):
+            await RisingEdge(dut.clk)
+            await Timer(1, unit="ns")
+            if int(dut.data_in_ready.value):
+                return
+        _drive(dut.data_in_valid, 0)
+        _drive(dut.data_in_last, 0)
+        raise TimeoutError("data_in_ready never asserted")
+
+    async def _send_beat(self, beat, keep, last, hold):
+        dut = self.dut
+        # hold: the previous beat was accepted 1 ns ago and ready is still
+        # high, so the new beat replaces it before the next posedge. If
+        # ready has fallen, drop valid first so that beat is not sampled again.
+        if not hold or not int(dut.data_in_ready.value):
+            _drive(dut.data_in_valid, 0)
+            _drive(dut.data_in_last, 0)
+            await self._wait_ready()
         _drive(dut.data_in, beat)
         _drive(dut.data_in_keep, keep)
         _drive(dut.data_in_last, 1 if last else 0)
         _drive(dut.data_in_valid, 1)
-        for _ in range(HANDSHAKE_TIMEOUT_CYCLES):
-            await ReadOnly()
-            if dut.data_in_ready.value:
-                break
-            await RisingEdge(dut.clk)
-        else:
-            _drive(dut.data_in_valid, 0)
-            _drive(dut.data_in_last, 0)
-            raise TimeoutError("data_in_ready never asserted")
         await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
 
     async def send_blocks(self, blocks):
         """Stream each 128-bit block as DATA_WIDTH beats. last marks the
         final beat of the message. Gaps are inserted between blocks."""
         dut = self.dut
         width, nbeats, full_keep = self._geom()
+        hold = False
         for idx, blk in enumerate(blocks):
             beats = self._split_block(blk, width, nbeats)
             for b, beat in enumerate(beats):
                 last = (idx == len(blocks) - 1) and (b == nbeats - 1)
-                await self._send_beat(beat, full_keep, last)
+                await self._send_beat(beat, full_keep, last, hold)
+                hold = True
             if idx < len(blocks) - 1 and rng.random() < IN_GAP_PROBABILITY:
                 _drive(dut.data_in_valid, 0)
                 _drive(dut.data_in_last, 0)
                 for _ in range(rng.randint(1, IN_GAP_MAX_CYCLES)):
                     await RisingEdge(dut.clk)
+                await Timer(1, unit="ns")
+                hold = False
         _drive(dut.data_in_valid, 0)
         _drive(dut.data_in_last, 0)
 
@@ -332,12 +345,12 @@ class AesDriver:
         _drive(dut.data_out_ready, 1)
         while len(beats) < need:
             await RisingEdge(dut.clk)
+            await Timer(1, unit="ns")
             budget -= 1
             if budget < 0:
                 raise TimeoutError(
                     f"received only {len(beats)}/{need} output beats "
                     f"({len(beats) // nbeats} blocks)")
-            await ReadOnly()
             if int(dut.data_out_valid.value):
                 beats.append(int(dut.data_out.value))
                 lasts.append(int(dut.data_out_last.value))

@@ -2,18 +2,22 @@
 *.vcd
 *.vvp
 *.fst
-sim/**/sim_build/
-sim/**/__pycache__/
+tb/**/sim_build/
+tb/**/work/
 **/__pycache__/
 *.pyc
-sim/**/sim.log
+tb/**/sim.log
+tb/**/sim_data.log
 
-# Vivado project, cache, and logs
+# Vivado project, cache, reports, and logs
 fpga/vivado_prj*/
+fpga/reports/
 fpga/.Xil/
 fpga/*.log
 fpga/*.jou
 fpga/*.backup.log
+fpga/*_synth.txt
+fpga/*_impl.txt
 *.str
 *.pb
 *.wdf
@@ -21,6 +25,7 @@ fpga/*.backup.log
 *.dcp
 *.bit
 *.ltx
+*.log
 
 # Simulator transcripts
 /transcript

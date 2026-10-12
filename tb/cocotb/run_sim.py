@@ -9,9 +9,9 @@ ECB / CBC / CTR in both directions against pycryptodome:
   * RTL encrypt  -> Python decrypt -> must equal original plaintext
   * Python encrypt -> RTL decrypt  -> must equal original plaintext
 
-Simulator selection: Icarus Verilog (`iverilog` on PATH) is preferred;
-if it is missing, fall back to the existing ModelSim installation at
-C:\\modeltech64_2020.4\\win64.
+Simulator selection: Icarus Verilog (`iverilog` on PATH) is preferred.
+If it is missing, fall back to ModelSim at MODELSIM_HOME, or
+C:\\modeltech64_2020.4\\win64 when that variable is unset.
 
 The runner import is compatible with cocotb 1.x (cocotb.runner) and
 2.x (cocotb_tools.runner).
@@ -44,7 +44,7 @@ DATA_LOG = HERE / "sim_data.log"
 VCD_PATH = HERE / "aes128_top.vcd"
 TOP_MODULE = "aes128_cocotb_harness"
 TEST_MODULE = "test_aes_crosscheck"
-MODELSIM_BIN = r"C:\modeltech64_2020.4\win64"
+MODELSIM_BIN = os.environ.get("MODELSIM_HOME", r"C:\modeltech64_2020.4\win64")
 
 
 def _get_runner_factory():
